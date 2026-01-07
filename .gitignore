@@ -1,0 +1,484 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, collection, doc, setDoc, getDoc, 
+  onSnapshot, query, addDoc, deleteDoc, updateDoc 
+} from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { 
+  Users, AlertTriangle, Settings, Plus, Trash2, 
+  Search, LogOut, ClipboardList, Printer, Save, ChevronRight, Lock, Unlock, UserPlus
+} from 'lucide-react';
+
+// Konfigurasi Firebase
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'smpn3-kombeng-cloud-v2';
+
+// Kode akses default untuk guru
+const TEACHER_ACCESS_CODE = "GURU3KOMBENG";
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [isAuthorized, setIsAuthorized] = useState(false);
+  const [accessInput, setAccessInput] = useState('');
+  const [view, setView] = useState('dashboard');
+  const [students, setStudents] = useState([]);
+  const [rules, setRules] = useState([]);
+  const [selectedStudent, setSelectedStudent] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [showLoginError, setShowLoginError] = useState(false);
+  
+  // State untuk Form
+  const [newStudent, setNewStudent] = useState({ nama: '', kelas: '', nis: '' });
+  const [newRule, setNewRule] = useState({ bab: '', label: '', point: 0 });
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth Error:", error);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const qStudents = collection(db, 'artifacts', appId, 'public', 'data', 'students');
+    const unsubStudents = onSnapshot(qStudents, (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setStudents(list);
+    }, (err) => console.error("Firestore Error Students:", err));
+
+    const qRules = collection(db, 'artifacts', appId, 'public', 'data', 'rules');
+    const unsubRules = onSnapshot(qRules, (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      if (list.length === 0) seedDefaultRules();
+      setRules(list);
+    }, (err) => console.error("Firestore Error Rules:", err));
+
+    return () => {
+      unsubStudents();
+      unsubRules();
+    };
+  }, [user]);
+
+  const seedDefaultRules = async () => {
+    const defaults = [
+      { bab: "UPACARA", label: "Terlambat/tidak ikut upacara", point: 10 },
+      { bab: "PAKAIAN", label: "Tidak mengenakan topi/dasi", point: 5 },
+      { bab: "KBM", label: "Terlambat masuk kelas (>10 menit)", point: 5 },
+      { bab: "PERGAULAN", label: "Merokok (dengan seragam)", point: 100 },
+      { bab: "PERGAULAN", label: "Perkelahian / Tawuran", point: 100 },
+      { bab: "PENAMPILAN", label: "Rambut putra tidak sesuai 3-2-1 cm", point: 25 }
+    ];
+    for (const r of defaults) {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'rules'), r);
+    }
+  };
+
+  const handleLogin = (e) => {
+    e.preventDefault();
+    if (accessInput === TEACHER_ACCESS_CODE) {
+      setIsAuthorized(true);
+      setShowLoginError(false);
+    } else {
+      setShowLoginError(true);
+    }
+  };
+
+  const handleAddStudent = async () => {
+    if (!newStudent.nama || !newStudent.kelas) return;
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'students'), {
+      ...newStudent,
+      totalPoin: 0,
+      logs: []
+    });
+    setNewStudent({ nama: '', kelas: '', nis: '' });
+  };
+
+  const handleAddViolation = async (student, rule) => {
+    const newPoint = student.totalPoin + rule.point;
+    const newLog = {
+      id: Date.now(),
+      label: rule.label,
+      point: rule.point,
+      date: new Date().toLocaleDateString('id-ID'),
+      recordedBy: user.uid
+    };
+    
+    const studentRef = doc(db, 'artifacts', appId, 'public', 'data', 'students', student.id);
+    await updateDoc(studentRef, {
+      totalPoin: newPoint,
+      logs: [...(student.logs || []), newLog]
+    });
+    
+    const updatedStudent = { ...student, totalPoin: newPoint, logs: [...(student.logs || []), newLog] };
+    setSelectedStudent(updatedStudent);
+  };
+
+  const getSanksi = (total) => {
+    if (total >= 450) return { label: "DIKEMBALIKAN KE ORANGTUA", color: "bg-red-700 text-white" };
+    if (total >= 375) return { label: "PROSES 5: SP III", color: "bg-red-600 text-white" };
+    if (total >= 300) return { label: "PROSES 4: PERINGATAN II", color: "bg-red-500 text-white" };
+    if (total >= 200) return { label: "PROSES 3: PERINGATAN I", color: "bg-orange-600 text-white" };
+    if (total >= 125) return { label: "PROSES 2: Panggilan Ortu", color: "bg-yellow-500 text-slate-900" };
+    if (total >= 50) return { label: "PROSES 1: Pembinaan Wali Kelas", color: "bg-blue-600 text-white" };
+    return { label: "Siswa Disiplin", color: "bg-slate-200 text-slate-600" };
+  };
+
+  const filteredStudents = students.filter(s => 
+    s.nama.toLowerCase().includes(searchTerm.toLowerCase()) || 
+    s.kelas.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  if (!isAuthorized) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-3xl shadow-2xl w-full max-w-md text-center">
+            <div className="bg-blue-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Lock className="text-blue-700" size={40} />
+            </div>
+            <h1 className="text-2xl font-black text-slate-800 mb-2">SMPN 3 KOMBENG</h1>
+            <p className="text-slate-500 mb-8 font-medium">Sistem Monitoring Kedisiplinan</p>
+            
+            <form onSubmit={handleLogin} className="space-y-4">
+                <div className="text-left">
+                    <label className="text-xs font-bold text-slate-400 uppercase ml-1">Kode Akses Guru</label>
+                    <input 
+                        type="password" 
+                        value={accessInput}
+                        onChange={(e) => setAccessInput(e.target.value)}
+                        placeholder="Masukkan Kode Guru..." 
+                        className={`w-full p-4 bg-slate-100 rounded-2xl outline-none focus:ring-4 focus:ring-blue-200 transition-all text-center text-lg tracking-widest ${showLoginError ? 'border-2 border-red-500' : ''}`}
+                    />
+                    {showLoginError && <p className="text-red-500 text-xs mt-2 font-bold text-center">Kode Akses Salah!</p>}
+                </div>
+                <button type="submit" className="w-full bg-blue-700 hover:bg-blue-800 text-white font-black py-4 rounded-2xl shadow-lg transition-transform active:scale-95">
+                    MASUK KE SISTEM
+                </button>
+            </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col pb-20">
+      <nav className="bg-white border-b sticky top-0 z-50 no-print">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex justify-between items-center">
+          <div className="flex items-center gap-3">
+             <div className="bg-blue-700 text-white p-2 rounded-xl">
+                 <AlertTriangle size={20} />
+             </div>
+             <div>
+                <h1 className="font-black text-sm text-slate-800 leading-tight">SMPN 3 KOMBENG</h1>
+                <p className="text-[10px] text-blue-600 font-bold uppercase tracking-wider">Database Terpusat</p>
+             </div>
+          </div>
+          <button onClick={() => setIsAuthorized(false)} className="p-2 text-slate-400 hover:text-red-600 transition-colors">
+              <LogOut size={20} />
+          </button>
+        </div>
+      </nav>
+
+      <main className="max-w-6xl mx-auto w-full p-4 flex-grow space-y-6">
+        {view === 'dashboard' && (
+          <div className="space-y-6 animate-in fade-in duration-500">
+             <div className="bg-blue-700 p-8 rounded-[2.5rem] text-white shadow-xl relative overflow-hidden">
+                <div className="relative z-10">
+                    <h2 className="text-3xl font-black mb-2 uppercase">Monitor Tatib</h2>
+                    <p className="opacity-80 text-sm max-w-sm mb-6 font-medium">Data tersinkronisasi antar guru secara real-time.</p>
+                    <div className="bg-white/10 backdrop-blur-md p-4 rounded-2xl flex gap-6 w-fit">
+                        <div>
+                            <p className="text-2xl font-black">{students.length}</p>
+                            <p className="text-[10px] uppercase font-bold opacity-60 italic tracking-tighter">Siswa Terdata</p>
+                        </div>
+                        <div className="border-l border-white/20 pl-6">
+                            <p className="text-2xl font-black">{rules.length}</p>
+                            <p className="text-[10px] uppercase font-bold opacity-60 italic tracking-tighter">Aturan Poin</p>
+                        </div>
+                    </div>
+                </div>
+                <Users className="absolute -bottom-10 -right-10 w-64 h-64 text-white/5 rotate-12" />
+             </div>
+
+             <div className="grid md:grid-cols-3 gap-6">
+                <div className="md:col-span-2 space-y-4">
+                    <div className="relative">
+                        <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={20} />
+                        <input 
+                            type="text" 
+                            placeholder="Cari nama siswa atau kelas..." 
+                            className="w-full pl-12 pr-4 py-4 bg-white border-2 border-slate-100 rounded-2xl shadow-sm outline-none focus:border-blue-500 transition-all font-medium"
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                        />
+                    </div>
+
+                    <div className="space-y-2">
+                        {searchTerm && filteredStudents.map(s => (
+                            <div key={s.id} onClick={() => {setSelectedStudent(s); setView('history')}} className="bg-white p-4 rounded-2xl border border-slate-100 hover:border-blue-200 shadow-sm flex justify-between items-center cursor-pointer transition-all hover:scale-[1.01]">
+                                <div className="flex items-center gap-4">
+                                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center font-black ${getSanksi(s.totalPoin).color}`}>
+                                        {s.totalPoin}
+                                    </div>
+                                    <div>
+                                        <p className="font-black text-slate-800 uppercase text-sm">{s.nama}</p>
+                                        <p className="text-xs text-slate-500 font-bold tracking-widest">KELAS {s.kelas}</p>
+                                    </div>
+                                </div>
+                                <ChevronRight className="text-slate-300" size={20} />
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="space-y-4">
+                    <h3 className="font-black text-slate-800 uppercase tracking-widest text-[10px] ml-1">Menu Admin</h3>
+                    <button onClick={() => setView('students')} className="w-full bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-4 hover:bg-slate-50 transition-colors">
+                        <div className="bg-emerald-100 text-emerald-600 p-3 rounded-xl"><UserPlus size={20}/></div>
+                        <span className="font-bold text-slate-700">Daftar Siswa</span>
+                    </button>
+                    <button onClick={() => setView('rules')} className="w-full bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-4 hover:bg-slate-50 transition-colors">
+                        <div className="bg-purple-100 text-purple-600 p-3 rounded-xl"><Settings size={20}/></div>
+                        <span className="font-bold text-slate-700">Master Aturan</span>
+                    </button>
+                </div>
+             </div>
+          </div>
+        )}
+
+        {view === 'students' && (
+            <div className="space-y-6 animate-in slide-in-from-right duration-500 no-print">
+                <div className="flex items-center justify-between">
+                    <button onClick={() => setView('dashboard')} className="text-slate-500 font-bold flex items-center gap-2"><ChevronRight className="rotate-180" size={18}/> KEMBALI</button>
+                    <h2 className="font-black text-xl text-slate-800 uppercase italic">Database Siswa</h2>
+                </div>
+
+                <div className="bg-white p-6 rounded-[2rem] border-2 border-blue-50 shadow-sm">
+                    <h3 className="font-black text-xs mb-4 uppercase tracking-widest text-blue-600">Pendaftaran Baru</h3>
+                    <div className="grid md:grid-cols-4 gap-4">
+                        <input type="text" placeholder="Nama Lengkap" className="bg-slate-100 p-3 rounded-xl outline-none font-bold" value={newStudent.nama} onChange={e => setNewStudent({...newStudent, nama: e.target.value.toUpperCase()})} />
+                        <input type="text" placeholder="Kelas" className="bg-slate-100 p-3 rounded-xl outline-none font-bold" value={newStudent.kelas} onChange={e => setNewStudent({...newStudent, kelas: e.target.value.toUpperCase()})} />
+                        <input type="text" placeholder="NIS" className="bg-slate-100 p-3 rounded-xl outline-none" value={newStudent.nis} onChange={e => setNewStudent({...newStudent, nis: e.target.value})} />
+                        <button onClick={handleAddStudent} className="bg-blue-700 text-white font-black rounded-xl hover:bg-blue-800 transition shadow-lg">TAMBAH</button>
+                    </div>
+                </div>
+
+                <div className="bg-white rounded-[2rem] border overflow-hidden shadow-sm">
+                    <table className="w-full text-sm">
+                        <thead className="bg-slate-50 border-b">
+                            <tr>
+                                <th className="p-4 text-left font-black text-[10px] text-slate-400 uppercase">Nama Siswa</th>
+                                <th className="p-4 text-center font-black text-[10px] text-slate-400 uppercase">Kelas</th>
+                                <th className="p-4 text-center font-black text-[10px] text-slate-400 uppercase">Poin</th>
+                                <th className="p-4 text-right font-black text-[10px] text-slate-400 uppercase">Aksi</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {students.sort((a,b) => a.nama.localeCompare(b.nama)).map(s => (
+                                <tr key={s.id} className="border-b hover:bg-slate-50 transition-colors">
+                                    <td className="p-4 font-bold text-slate-700 uppercase">{s.nama}</td>
+                                    <td className="p-4 text-center font-bold text-slate-500">{s.kelas}</td>
+                                    <td className="p-4 text-center font-black text-blue-600">{s.totalPoin}</td>
+                                    <td className="p-4 text-right">
+                                        <button onClick={() => {setSelectedStudent(s); setView('history')}} className="text-blue-600 font-bold text-xs mr-4 hover:underline">DETAIL</button>
+                                        <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', s.id))} className="text-red-300 hover:text-red-500"><Trash2 size={16}/></button>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        )}
+
+        {view === 'rules' && (
+            <div className="space-y-6 animate-in slide-in-from-right duration-500 no-print">
+                <div className="flex items-center justify-between">
+                    <button onClick={() => setView('dashboard')} className="text-slate-500 font-bold flex items-center gap-2"><ChevronRight className="rotate-180" size={18}/> KEMBALI</button>
+                    <h2 className="font-black text-xl text-slate-800 uppercase italic">Aturan Poin</h2>
+                </div>
+
+                <div className="bg-white p-6 rounded-[2rem] border-2 border-purple-50 shadow-sm">
+                    <div className="grid md:grid-cols-4 gap-4">
+                        <input type="text" placeholder="Bab" className="bg-slate-100 p-3 rounded-xl outline-none" value={newRule.bab} onChange={e => setNewRule({...newRule, bab: e.target.value.toUpperCase()})} />
+                        <input type="text" placeholder="Pelanggaran" className="bg-slate-100 p-3 rounded-xl outline-none" value={newRule.label} onChange={e => setNewRule({...newRule, label: e.target.value})} />
+                        <input type="number" placeholder="Poin" className="bg-slate-100 p-3 rounded-xl outline-none" value={newRule.point} onChange={e => setNewRule({...newRule, point: parseInt(e.target.value)})} />
+                        <button onClick={async () => {
+                            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'rules'), newRule);
+                            setNewRule({ bab: '', label: '', point: 0 });
+                        }} className="bg-purple-700 text-white font-black rounded-xl shadow-lg">SIMPAN</button>
+                    </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {rules.sort((a,b) => a.bab.localeCompare(b.bab)).map(r => (
+                        <div key={r.id} className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm group">
+                            <div className="flex justify-between items-start mb-2">
+                                <span className="text-[10px] bg-slate-100 px-2 py-1 rounded-lg text-slate-500 font-black tracking-widest uppercase">{r.bab}</span>
+                                <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rules', r.id))} className="text-slate-200 hover:text-red-500 transition-colors">
+                                    <Trash2 size={16}/>
+                                </button>
+                            </div>
+                            <p className="font-bold text-slate-700 text-sm mb-2 leading-tight">{r.label}</p>
+                            <p className="text-red-600 font-black text-lg">{r.point} <span className="text-xs uppercase opacity-50">Poin</span></p>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        )}
+
+        {view === 'history' && selectedStudent && (
+            <div className="space-y-6 animate-in slide-in-from-bottom duration-500">
+                <div className="flex items-center justify-between no-print">
+                    <button onClick={() => setView('dashboard')} className="text-slate-500 font-bold flex items-center gap-2"><ChevronRight className="rotate-180" size={18}/> KEMBALI</button>
+                    <button onClick={() => window.print()} className="bg-slate-800 text-white p-3 rounded-xl flex items-center gap-2 hover:scale-105 transition-transform">
+                        <Printer size={20}/> <span className="font-black text-xs uppercase tracking-widest">Cetak Kartu</span>
+                    </button>
+                </div>
+
+                <div className="bg-white p-8 rounded-[3rem] shadow-xl border-2 border-slate-100 flex flex-col md:flex-row gap-8 items-center no-print">
+                    <div className={`w-36 h-36 rounded-[2.5rem] flex flex-col items-center justify-center shadow-lg transform rotate-2 ${getSanksi(selectedStudent.totalPoin).color}`}>
+                        <span className="text-5xl font-black">{selectedStudent.totalPoin}</span>
+                        <span className="text-[10px] font-bold uppercase tracking-widest opacity-80">Poin</span>
+                    </div>
+                    <div className="flex-grow text-center md:text-left">
+                        <h3 className="text-3xl font-black text-slate-800 leading-none mb-1 uppercase italic">{selectedStudent.nama}</h3>
+                        <p className="text-slate-400 font-black tracking-widest text-xs mb-4 uppercase">KELAS {selectedStudent.kelas} • NIS {selectedStudent.nis || '-'}</p>
+                        <div className={`px-6 py-2 rounded-2xl w-fit mx-auto md:ml-0 font-black text-[10px] uppercase shadow-md ${getSanksi(selectedStudent.totalPoin).color}`}>
+                            STATUS: {getSanksi(selectedStudent.totalPoin).label}
+                        </div>
+                    </div>
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-6 no-print">
+                    <div className="md:col-span-1 bg-white p-6 rounded-[2.5rem] border shadow-sm">
+                        <h4 className="font-black text-[10px] mb-4 text-slate-400 uppercase tracking-widest">Catat Baru</h4>
+                        <div className="space-y-4">
+                            <select className="w-full bg-slate-100 p-4 rounded-2xl text-xs font-bold outline-none" id="violationSelect">
+                                <option value="">Pilih Jenis Pelanggaran...</option>
+                                {rules.sort((a,b) => a.bab.localeCompare(b.bab)).map(r => (
+                                    <option key={r.id} value={r.id}>[{r.bab}] {r.label} ({r.point} Poin)</option>
+                                ))}
+                            </select>
+                            <button 
+                                onClick={() => {
+                                    const select = document.getElementById('violationSelect');
+                                    const rule = rules.find(r => r.id === select.value);
+                                    if(rule) {
+                                        handleAddViolation(selectedStudent, rule);
+                                        select.value = "";
+                                    }
+                                }}
+                                className="w-full bg-red-600 text-white font-black py-4 rounded-2xl hover:bg-red-700 shadow-lg"
+                            >
+                                SIMPAN POIN
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="md:col-span-2 bg-white rounded-[2.5rem] border shadow-sm overflow-hidden">
+                        <div className="p-5 bg-slate-50 border-b flex justify-between items-center">
+                            <h4 className="font-black text-[10px] text-slate-400 uppercase tracking-widest">Riwayat Pelanggaran</h4>
+                        </div>
+                        <div className="max-h-[300px] overflow-y-auto">
+                            {(selectedStudent.logs || []).length === 0 ? (
+                                <p className="p-20 text-center text-slate-300 font-bold italic">Belum ada data.</p>
+                            ) : (
+                                selectedStudent.logs.sort((a,b) => b.id - a.id).map((log, idx) => (
+                                    <div key={idx} className="p-5 border-b flex justify-between items-center hover:bg-slate-50 transition-colors">
+                                        <div>
+                                            <p className="font-black text-slate-800 text-sm mb-1 uppercase tracking-tight leading-tight">{log.label}</p>
+                                            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">{log.date} • CLOUD SYNC</p>
+                                        </div>
+                                        <div className="text-red-600 font-black text-lg bg-red-50 w-10 h-10 rounded-xl flex items-center justify-center">
+                                            +{log.point}
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Print Template - Desain Resmi */}
+                <div className="print-only p-12 bg-white text-black font-serif">
+                    <div className="text-center border-b-4 border-black pb-4 mb-8">
+                        <h1 className="text-2xl font-black uppercase underline decoration-2 underline-offset-4">Kartu Kendali Kedisiplinan Siswa</h1>
+                        <p className="mt-2 font-black text-lg">SMP NEGERI 3 KOMBENG</p>
+                        <p className="text-sm font-bold italic">Tahun Pelajaran 2025/2026</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4 mb-8 border-2 border-black p-4 rounded-lg font-bold">
+                        <p>NAMA: {selectedStudent.nama}</p>
+                        <p className="text-right">TOTAL POIN: {selectedStudent.totalPoin}</p>
+                        <p>KELAS: {selectedStudent.kelas}</p>
+                        <p className="text-right italic">STATUS: {getSanksi(selectedStudent.totalPoin).label}</p>
+                    </div>
+                    <table className="w-full border-collapse border-2 border-black">
+                        <thead>
+                            <tr className="bg-slate-100">
+                                <th className="border-2 border-black p-2 text-xs">TGL</th>
+                                <th className="border-2 border-black p-2 text-xs">JENIS PELANGGARAN</th>
+                                <th className="border-2 border-black p-2 text-xs">POIN</th>
+                                <th className="border-2 border-black p-2 text-xs">TTD GURU</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {(selectedStudent.logs || []).map((l, i) => (
+                                <tr key={i}>
+                                    <td className="border-2 border-black p-2 text-center text-[10px]">{l.date}</td>
+                                    <td className="border-2 border-black p-2 text-[10px] uppercase font-bold">{l.label}</td>
+                                    <td className="border-2 border-black p-2 text-center font-black">{l.point}</td>
+                                    <td className="border-2 border-black p-2"></td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    <div className="grid grid-cols-2 mt-12 text-center text-xs font-bold">
+                        <div>
+                            <p>Mengetahui,</p>
+                            <p className="mb-16 uppercase italic">Kepala Sekolah</p>
+                            <p className="underline decoration-black">YUNITA LUMBAN, S.Pd.</p>
+                            <p>NIP 19910606 201403 2 004</p>
+                        </div>
+                        <div>
+                            <p>Kombeng, ......................... 202...</p>
+                            <p className="mb-16 uppercase italic">Wali Kelas</p>
+                            <p className="underline">....................................................</p>
+                            <p>NIP. ............................................</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        )}
+      </main>
+
+      <div className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t p-2 flex justify-around items-center no-print">
+         <button onClick={() => setView('dashboard')} className={`flex flex-col items-center p-2 rounded-2xl transition-all ${view === 'dashboard' ? 'text-blue-700' : 'text-slate-400'}`}>
+            <ClipboardList size={20}/>
+            <span className="text-[8px] font-black mt-1 uppercase tracking-tighter">Beranda</span>
+         </button>
+         <button onClick={() => setView('students')} className={`flex flex-col items-center p-2 rounded-2xl transition-all ${view === 'students' ? 'text-blue-700' : 'text-slate-400'}`}>
+            <Users size={20}/>
+            <span className="text-[8px] font-black mt-1 uppercase tracking-tighter">Siswa</span>
+         </button>
+         <button onClick={() => setView('rules')} className={`flex flex-col items-center p-2 rounded-2xl transition-all ${view === 'rules' ? 'text-blue-700' : 'text-slate-400'}`}>
+            <Settings size={20}/>
+            <span className="text-[8px] font-black mt-1 uppercase tracking-tighter">Aturan</span>
+         </button>
+      </div>
+    </div>
+  );
+}
